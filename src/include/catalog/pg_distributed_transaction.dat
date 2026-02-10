@@ -1,0 +1,15 @@
+#----------------------------------------------------------------------
+#
+# pg_distributed_transaction.dat
+#    Initial contents of the pg_distributed_transaction system catalog.
+#
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+#
+# src/include/catalog/pg_distributed_transaction.dat
+#
+#----------------------------------------------------------------------
+
+[
+# Distributed transactions are tracked at runtime
+# No initial entries required
+]

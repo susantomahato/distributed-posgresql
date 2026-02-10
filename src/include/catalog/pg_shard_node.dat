@@ -1,0 +1,15 @@
+#----------------------------------------------------------------------
+#
+# pg_shard_node.dat
+#    Initial contents of the pg_shard_node system catalog.
+#
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+#
+# src/include/catalog/pg_shard_node.dat
+#
+#----------------------------------------------------------------------
+
+[
+# Shard nodes are registered dynamically by administrators
+# No initial entries required
+]

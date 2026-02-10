@@ -1,0 +1,15 @@
+#----------------------------------------------------------------------
+#
+# pg_sharded_table.dat
+#    Initial contents of the pg_sharded_table system catalog.
+#
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+#
+# src/include/catalog/pg_sharded_table.dat
+#
+#----------------------------------------------------------------------
+
+[
+# Sharded tables are created dynamically via CREATE TABLE ... SHARD BY
+# No initial entries required
+]

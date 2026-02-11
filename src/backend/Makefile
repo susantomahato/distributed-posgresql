@@ -80,7 +80,7 @@ ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
 
-override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE) -Wl,-rpath,@loader_path/../lib -headerpad_max_install_names
+override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
 
 ##########################################################################
 

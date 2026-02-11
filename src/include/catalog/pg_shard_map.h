@@ -30,11 +30,11 @@ CATALOG(pg_shard_map,9020,ShardMapRelationId)
 	/* unique shard identifier */
 	int32		shardid;
 
-	/* OID of the sharded table */
-	Oid			relid BKI_LOOKUP(pg_sharded_table);
+	/* OID of the sharded table (references pg_class) */
+	Oid			relid BKI_LOOKUP(pg_class);
 
-	/* node name where shard resides */
-	NameData	nodename BKI_LOOKUP_OPT(pg_shard_node);
+	/* node name where shard resides (FK to pg_shard_node.nodename) */
+	NameData	nodename;
 
 	/* shard method: 'h' = hash, 'r' = range */
 	char		shardmethod BKI_FORCE_NOT_NULL;

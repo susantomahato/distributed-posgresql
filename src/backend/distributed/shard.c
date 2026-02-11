@@ -239,20 +239,46 @@ GetShardForKey(Oid table_oid, Datum shard_key)
 		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 		{
 			Form_pg_shard_map form = (Form_pg_shard_map) GETSTRUCT(tuple);
+			TupleDesc	map_desc = RelationGetDescr(shard_map_rel);
+			Datum		d_hashmin,
+						d_hashmax,
+						d_shardstate;
+			bool		n_hashmin,
+						n_hashmax,
+						n_shardstate;
+			int32		cur_hashmin,
+						cur_hashmax;
+			char		cur_shardstate;
 
+			/*
+			 * hashmin, hashmax, shardstate are after variable-length
+			 * rangemin/rangemax text fields — must use heap_getattr.
+			 */
+			d_hashmin = heap_getattr(tuple, Anum_pg_shard_map_hashmin,
+									 map_desc, &n_hashmin);
+			d_hashmax = heap_getattr(tuple, Anum_pg_shard_map_hashmax,
+									 map_desc, &n_hashmax);
+			d_shardstate = heap_getattr(tuple, Anum_pg_shard_map_shardstate,
+										map_desc, &n_shardstate);
+
+			cur_hashmin = n_hashmin ? 0 : DatumGetInt32(d_hashmin);
+			cur_hashmax = n_hashmax ? 0 : DatumGetInt32(d_hashmax);
+			cur_shardstate = n_shardstate ? '\0' : DatumGetChar(d_shardstate);
+
+			/* shardmethod is before varlena fields, safe via form */
 			if (form->shardmethod == SHARD_METHOD_CHAR_HASH &&
-				hash_value >= form->hashmin &&
-				hash_value < form->hashmax)
+				hash_value >= cur_hashmin &&
+				hash_value < cur_hashmax)
 			{
 				result = MakeShardMapEntry(form->shardid,
 										   form->relid,
 										   NameStr(form->nodename),
 										   SHARD_METHOD_HASH);
-				result->hash_min = form->hashmin;
-				result->hash_max = form->hashmax;
-				result->state = (form->shardstate == SHARD_STATE_CHAR_ACTIVE) ?
+				result->hash_min = cur_hashmin;
+				result->hash_max = cur_hashmax;
+				result->state = (cur_shardstate == SHARD_STATE_CHAR_ACTIVE) ?
 					SHARD_STATE_ACTIVE :
-					(form->shardstate == SHARD_STATE_CHAR_SPLITTING) ?
+					(cur_shardstate == SHARD_STATE_CHAR_SPLITTING) ?
 					SHARD_STATE_SPLITTING : SHARD_STATE_MIGRATING;
 				break;
 			}
@@ -305,9 +331,18 @@ GetAllShardsForTable(Oid table_oid)
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_shard_map form = (Form_pg_shard_map) GETSTRUCT(tuple);
+		TupleDesc	map_desc = RelationGetDescr(shard_map_rel);
 		ShardMapEntry *entry;
 		ShardMethod method;
+		Datum		d_hashmin,
+					d_hashmax,
+					d_shardstate;
+		bool		n_hashmin,
+					n_hashmax,
+					n_shardstate;
+		char		cur_shardstate;
 
+		/* shardmethod is before varlena fields, safe via form */
 		method = (form->shardmethod == SHARD_METHOD_CHAR_HASH) ?
 			SHARD_METHOD_HASH : SHARD_METHOD_RANGE;
 
@@ -316,15 +351,27 @@ GetAllShardsForTable(Oid table_oid)
 								  NameStr(form->nodename),
 								  method);
 
+		/*
+		 * hashmin, hashmax, shardstate are after variable-length
+		 * rangemin/rangemax text fields — must use heap_getattr.
+		 */
+		d_hashmin = heap_getattr(tuple, Anum_pg_shard_map_hashmin,
+								 map_desc, &n_hashmin);
+		d_hashmax = heap_getattr(tuple, Anum_pg_shard_map_hashmax,
+								 map_desc, &n_hashmax);
+		d_shardstate = heap_getattr(tuple, Anum_pg_shard_map_shardstate,
+									map_desc, &n_shardstate);
+
 		if (method == SHARD_METHOD_HASH)
 		{
-			entry->hash_min = form->hashmin;
-			entry->hash_max = form->hashmax;
+			entry->hash_min = n_hashmin ? 0 : DatumGetInt32(d_hashmin);
+			entry->hash_max = n_hashmax ? 0 : DatumGetInt32(d_hashmax);
 		}
 
-		entry->state = (form->shardstate == SHARD_STATE_CHAR_ACTIVE) ?
+		cur_shardstate = n_shardstate ? '\0' : DatumGetChar(d_shardstate);
+		entry->state = (cur_shardstate == SHARD_STATE_CHAR_ACTIVE) ?
 			SHARD_STATE_ACTIVE :
-			(form->shardstate == SHARD_STATE_CHAR_SPLITTING) ?
+			(cur_shardstate == SHARD_STATE_CHAR_SPLITTING) ?
 			SHARD_STATE_SPLITTING : SHARD_STATE_MIGRATING;
 
 		result = lappend(result, entry);
@@ -445,15 +492,21 @@ bool
 ShardNodeIsOnline(const char *node_name)
 {
 	HeapTuple	tuple;
-	Form_pg_shard_node form;
+	Datum		datum;
+	bool		isnull;
 	bool		result;
 
 	tuple = SearchSysCache1(SHARDNODENAME, CStringGetDatum(node_name));
 	if (!HeapTupleIsValid(tuple))
 		return false;
 
-	form = (Form_pg_shard_node) GETSTRUCT(tuple);
-	result = (form->nodestate == SHARD_NODE_STATE_ONLINE);
+	/*
+	 * nodestate is after the variable-length nodeconnstr field,
+	 * so we must use SysCacheGetAttr instead of Form_ access.
+	 */
+	datum = SysCacheGetAttr(SHARDNODENAME, tuple,
+							Anum_pg_shard_node_nodestate, &isnull);
+	result = (!isnull && DatumGetChar(datum) == SHARD_NODE_STATE_ONLINE);
 
 	ReleaseSysCache(tuple);
 
@@ -468,15 +521,18 @@ int32
 GetShardCount(Oid table_oid)
 {
 	HeapTuple	tuple;
-	Form_pg_sharded_table form;
+	Datum		datum;
+	bool		isnull;
 	int32		result;
 
 	tuple = SearchSysCache1(SHARDEDTABLE, ObjectIdGetDatum(table_oid));
 	if (!HeapTupleIsValid(tuple))
 		return 0;
 
-	form = (Form_pg_sharded_table) GETSTRUCT(tuple);
-	result = form->shardcount;
+	/* shardcount is after variable-length shardkey — use SysCacheGetAttr */
+	datum = SysCacheGetAttr(SHARDEDTABLE, tuple,
+							Anum_pg_sharded_table_shardcount, &isnull);
+	result = isnull ? 0 : DatumGetInt32(datum);
 
 	ReleaseSysCache(tuple);
 

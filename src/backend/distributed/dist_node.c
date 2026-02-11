@@ -106,13 +106,33 @@ dist_node_status(PG_FUNCTION_ARGS)
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_shard_node form = (Form_pg_shard_node) GETSTRUCT(tuple);
+		TupleDesc	reldesc = RelationGetDescr(rel);
 		Datum		values[4];
 		bool		nulls[4] = {false};
+		Datum		datum;
+		bool		isnull;
 
+		/* nodename is fixed-length (NameData), safe to access via form */
 		values[0] = NameGetDatum(&form->nodename);
-		values[1] = CharGetDatum(form->nodestate);
-		values[2] = Int32GetDatum(form->shardcount);
-		values[3] = TimestampTzGetDatum(form->createdat);
+
+		/*
+		 * Fields after the variable-length nodeconnstr (text) cannot be
+		 * accessed via the Form_ pointer — use heap_getattr instead.
+		 */
+		datum = heap_getattr(tuple, Anum_pg_shard_node_nodestate,
+							 reldesc, &isnull);
+		values[1] = datum;
+		nulls[1] = isnull;
+
+		datum = heap_getattr(tuple, Anum_pg_shard_node_shardcount,
+							 reldesc, &isnull);
+		values[2] = datum;
+		nulls[2] = isnull;
+
+		datum = heap_getattr(tuple, Anum_pg_shard_node_nodeconnstr,
+							 reldesc, &isnull);
+		values[3] = datum;
+		nulls[3] = isnull;
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
@@ -229,8 +249,19 @@ GetAllDistNodes(void)
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
 		Form_pg_shard_node form = (Form_pg_shard_node) GETSTRUCT(tuple);
+		Datum		state_datum;
+		bool		state_isnull;
+		char		nodestate;
 
-		if (form->nodestate == SHARD_NODE_STATE_ONLINE)
+		/*
+		 * nodestate is after the variable-length nodeconnstr field,
+		 * so we must use heap_getattr instead of form->nodestate.
+		 */
+		state_datum = heap_getattr(tuple, Anum_pg_shard_node_nodestate,
+								   RelationGetDescr(rel), &state_isnull);
+		nodestate = state_isnull ? '\0' : DatumGetChar(state_datum);
+
+		if (nodestate == SHARD_NODE_STATE_ONLINE)
 			result = lappend(result, pstrdup(NameStr(form->nodename)));
 	}
 

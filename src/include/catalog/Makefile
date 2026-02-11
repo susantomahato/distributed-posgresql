@@ -81,7 +81,12 @@ CATALOG_HEADERS := \
 	pg_publication_namespace.h \
 	pg_publication_rel.h \
 	pg_subscription.h \
-	pg_subscription_rel.h
+	pg_subscription_rel.h \
+	pg_shard_node.h \
+	pg_shard_map.h \
+	pg_sharded_table.h \
+	pg_distributed_transaction.h \
+	pg_dist_placement.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 
@@ -112,7 +117,12 @@ POSTGRES_BKI_DATA = \
 	pg_ts_dict.dat \
 	pg_ts_parser.dat \
 	pg_ts_template.dat \
-	pg_type.dat
+	pg_type.dat \
+	pg_shard_node.dat \
+	pg_shard_map.dat \
+	pg_sharded_table.dat \
+	pg_distributed_transaction.dat \
+	pg_dist_placement.dat
 
 GENBKI_OUTPUT_FILES = \
 	$(GENERATED_HEADERS) \

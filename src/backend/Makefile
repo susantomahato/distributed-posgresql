@@ -24,6 +24,7 @@ SUBDIRS = \
 	catalog \
 	parser \
 	commands \
+	distributed \
 	executor \
 	foreign \
 	lib \
@@ -69,6 +70,8 @@ OBJS = \
 LIBS := $(filter-out -lpgport -lpgcommon, $(LIBS))
 # The backend conditionally needs libraries that most executables don't need.
 LIBS += $(LDAP_LIBS_BE) $(ICU_LIBS) $(LIBURING_LIBS)
+# The distributed subsystem needs libpq for inter-node communication.
+LIBS += $(libpq)
 
 # The backend doesn't need everything that's in LIBS, however
 LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses, $(LIBS))
@@ -77,11 +80,11 @@ ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
 
-override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
+override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE) -Wl,-rpath,@loader_path/../lib -headerpad_max_install_names
 
 ##########################################################################
 
-all: submake-libpgport submake-catalog-headers submake-utils-headers postgres
+all: submake-libpgport submake-libpq submake-catalog-headers submake-utils-headers postgres
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)

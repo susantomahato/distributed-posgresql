@@ -17,6 +17,7 @@
 #define PG_SHARD_NODE_H
 
 #include "catalog/genbki.h"
+#include "datatype/timestamp.h"
 #include "catalog/pg_shard_node_d.h"
 
 /* ----------------
@@ -39,10 +40,10 @@ CATALOG(pg_shard_node,9000,ShardNodeRelationId)
 	int32		shardcount BKI_DEFAULT(0);
 
 	/* last successful health check */
-	timestamptz	lasthealthcheck;
+	TimestampTz	lasthealthcheck;
 
 	/* node creation timestamp */
-	timestamptz	createdat BKI_DEFAULT(now);
+	TimestampTz	createdat BKI_DEFAULT(now);
 } FormData_pg_shard_node;
 
 /* ----------------
@@ -52,9 +53,9 @@ CATALOG(pg_shard_node,9000,ShardNodeRelationId)
  */
 typedef FormData_pg_shard_node *Form_pg_shard_node;
 
-DECLARE_TOAST(pg_shard_node, 9001, 9002);
+DECLARE_TOAST(pg_shard_node, 9101, 9102);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_shard_node_nodename_index, 9003, ShardNodeNodenameIndexId, pg_shard_node, btree(nodename name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_shard_node_nodename_index, 9103, ShardNodeNodenameIndexId, pg_shard_node, btree(nodename name_ops));
 
 MAKE_SYSCACHE(SHARDNODENAME, pg_shard_node_nodename_index, 4);
 

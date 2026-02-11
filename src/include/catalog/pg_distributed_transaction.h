@@ -19,6 +19,8 @@
 
 #include "catalog/genbki.h"
 #include "catalog/pg_distributed_transaction_d.h"
+#include "datatype/timestamp.h"
+#include "nodes/pg_list.h"
 
 /* ----------------
  *		pg_distributed_transaction definition.  cpp turns this into
@@ -37,10 +39,10 @@ CATALOG(pg_distributed_transaction,9030,DistributedTransactionRelationId)
 	char		txnstate BKI_FORCE_NOT_NULL;
 
 	/* transaction start timestamp */
-	timestamptz	startedat BKI_FORCE_NOT_NULL;
+	TimestampTz	startedat BKI_FORCE_NOT_NULL;
 
 	/* timestamp when all participants prepared */
-	timestamptz	preparedat;
+	TimestampTz	preparedat;
 } FormData_pg_distributed_transaction;
 
 /* ----------------
@@ -50,9 +52,9 @@ CATALOG(pg_distributed_transaction,9030,DistributedTransactionRelationId)
  */
 typedef FormData_pg_distributed_transaction *Form_pg_distributed_transaction;
 
-DECLARE_TOAST(pg_distributed_transaction, 9031, 9032);
+DECLARE_TOAST(pg_distributed_transaction, 9131, 9132);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_distributed_transaction_gid_index, 9033, DistributedTransactionGidIndexId, pg_distributed_transaction, btree(gid text_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_distributed_transaction_gid_index, 9133, DistributedTransactionGidIndexId, pg_distributed_transaction, btree(gid text_ops));
 
 MAKE_SYSCACHE(DISTRIBUTEDTXNGID, pg_distributed_transaction_gid_index, 4);
 

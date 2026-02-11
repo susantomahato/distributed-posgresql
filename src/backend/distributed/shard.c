@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/indexing.h"
@@ -23,6 +24,7 @@
 #include "catalog/pg_shard_node.h"
 #include "catalog/pg_sharded_table.h"
 #include "distributed/shard.h"
+#include "commands/defrem.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -172,8 +174,7 @@ ComputeShardHash(Datum key, Oid key_type)
 	int32		hash_value;
 
 	/* Get the hash function for this type */
-	hash_proc = get_opfamily_proc(HASH_AM_OID,
-								   get_opclass_family(get_opclass_for_type(key_type)),
+	hash_proc = get_opfamily_proc(get_opclass_family(get_opclass_for_type(key_type)),
 								   key_type,
 								   key_type,
 								   HASHSTANDARD_PROC);
@@ -220,11 +221,11 @@ GetShardForKey(Oid table_oid, Datum shard_key)
 
 	/* Set up scan key for table OID */
 	ScanKeyInit(&skey[0],
-				Anum_pg_shard_map_tableoid,
+				Anum_pg_shard_map_relid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(table_oid));
 
-	scan = systable_beginscan(shard_map_rel, ShardMapTableoidIndexId,
+	scan = systable_beginscan(shard_map_rel, ShardMapRelidIndexId,
 							   true, NULL, 1, skey);
 
 	if (table_info->shard_method == SHARD_METHOD_HASH)
@@ -239,19 +240,19 @@ GetShardForKey(Oid table_oid, Datum shard_key)
 		{
 			Form_pg_shard_map form = (Form_pg_shard_map) GETSTRUCT(tuple);
 
-			if (form->shardmethod == SHARD_METHOD_HASH &&
+			if (form->shardmethod == SHARD_METHOD_CHAR_HASH &&
 				hash_value >= form->hashmin &&
 				hash_value < form->hashmax)
 			{
 				result = MakeShardMapEntry(form->shardid,
-										   form->tableoid,
+										   form->relid,
 										   NameStr(form->nodename),
 										   SHARD_METHOD_HASH);
 				result->hash_min = form->hashmin;
 				result->hash_max = form->hashmax;
-				result->state = (form->shardstate == SHARD_STATE_ACTIVE) ?
+				result->state = (form->shardstate == SHARD_STATE_CHAR_ACTIVE) ?
 					SHARD_STATE_ACTIVE :
-					(form->shardstate == SHARD_STATE_SPLITTING) ?
+					(form->shardstate == SHARD_STATE_CHAR_SPLITTING) ?
 					SHARD_STATE_SPLITTING : SHARD_STATE_MIGRATING;
 				break;
 			}
@@ -294,11 +295,11 @@ GetAllShardsForTable(Oid table_oid)
 
 	/* Set up scan key for table OID */
 	ScanKeyInit(&skey[0],
-				Anum_pg_shard_map_tableoid,
+				Anum_pg_shard_map_relid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(table_oid));
 
-	scan = systable_beginscan(shard_map_rel, ShardMapTableoidIndexId,
+	scan = systable_beginscan(shard_map_rel, ShardMapRelidIndexId,
 							   true, NULL, 1, skey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
@@ -307,11 +308,11 @@ GetAllShardsForTable(Oid table_oid)
 		ShardMapEntry *entry;
 		ShardMethod method;
 
-		method = (form->shardmethod == SHARD_METHOD_HASH) ?
+		method = (form->shardmethod == SHARD_METHOD_CHAR_HASH) ?
 			SHARD_METHOD_HASH : SHARD_METHOD_RANGE;
 
 		entry = MakeShardMapEntry(form->shardid,
-								  form->tableoid,
+								  form->relid,
 								  NameStr(form->nodename),
 								  method);
 
@@ -321,9 +322,9 @@ GetAllShardsForTable(Oid table_oid)
 			entry->hash_max = form->hashmax;
 		}
 
-		entry->state = (form->shardstate == SHARD_STATE_ACTIVE) ?
+		entry->state = (form->shardstate == SHARD_STATE_CHAR_ACTIVE) ?
 			SHARD_STATE_ACTIVE :
-			(form->shardstate == SHARD_STATE_SPLITTING) ?
+			(form->shardstate == SHARD_STATE_CHAR_SPLITTING) ?
 			SHARD_STATE_SPLITTING : SHARD_STATE_MIGRATING;
 
 		result = lappend(result, entry);
@@ -404,7 +405,7 @@ GetShardedTableInfo(Oid table_oid)
 
 	info = MakeShardedTableInfo(table_oid,
 								attnums,
-								(form->shardmethod == SHARD_METHOD_HASH) ?
+								(form->shardmethod == SHARD_METHOD_CHAR_HASH) ?
 								SHARD_METHOD_HASH : SHARD_METHOD_RANGE,
 								form->shardcount);
 
@@ -429,7 +430,7 @@ ShardIsActive(int32 shard_id)
 		return false;
 
 	form = (Form_pg_shard_map) GETSTRUCT(tuple);
-	result = (form->shardstate == SHARD_STATE_ACTIVE);
+	result = (form->shardstate == SHARD_STATE_CHAR_ACTIVE);
 
 	ReleaseSysCache(tuple);
 
@@ -480,4 +481,25 @@ GetShardCount(Oid table_oid)
 	ReleaseSysCache(tuple);
 
 	return result;
+}
+
+/*
+ * get_opclass_for_type
+ *		Get the default hash operator class for a given type.
+ *
+ * This is a convenience wrapper around GetDefaultOpClass().
+ */
+Oid
+get_opclass_for_type(Oid type_oid)
+{
+	Oid			opclass;
+
+	opclass = GetDefaultOpClass(type_oid, HASH_AM_OID);
+	if (!OidIsValid(opclass))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("no default hash operator class for type %s",
+						format_type_be(type_oid))));
+
+	return opclass;
 }

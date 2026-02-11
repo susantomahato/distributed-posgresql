@@ -17,6 +17,7 @@
 #define PG_SHARDED_TABLE_H
 
 #include "catalog/genbki.h"
+#include "datatype/timestamp.h"
 #include "catalog/pg_sharded_table_d.h"
 
 /* ----------------
@@ -27,7 +28,7 @@
 CATALOG(pg_sharded_table,9010,ShardedTableRelationId)
 {
 	/* OID of the sharded table */
-	Oid			tableoid BKI_LOOKUP(pg_class);
+	Oid			relid BKI_LOOKUP(pg_class);
 
 	/* shard key column names (array) */
 	text		shardkey[1] BKI_FORCE_NOT_NULL;
@@ -39,7 +40,7 @@ CATALOG(pg_sharded_table,9010,ShardedTableRelationId)
 	int32		shardcount BKI_DEFAULT(1);
 
 	/* table creation timestamp */
-	timestamptz	createdat BKI_DEFAULT(now);
+	TimestampTz	createdat BKI_DEFAULT(now);
 } FormData_pg_sharded_table;
 
 /* ----------------
@@ -49,19 +50,19 @@ CATALOG(pg_sharded_table,9010,ShardedTableRelationId)
  */
 typedef FormData_pg_sharded_table *Form_pg_sharded_table;
 
-DECLARE_TOAST(pg_sharded_table, 9011, 9012);
+DECLARE_TOAST(pg_sharded_table, 9111, 9112);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_sharded_table_tableoid_index, 9013, ShardedTableTableoidIndexId, pg_sharded_table, btree(tableoid oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_sharded_table_relid_index, 9113, ShardedTableRelidIndexId, pg_sharded_table, btree(relid oid_ops));
 
-MAKE_SYSCACHE(SHARDEDTABLE, pg_sharded_table_tableoid_index, 4);
+MAKE_SYSCACHE(SHARDEDTABLE, pg_sharded_table_relid_index, 4);
 
 /*
  * Shard method constants
  */
-#define SHARD_METHOD_HASH		'h'
-#define SHARD_METHOD_RANGE		'r'
+#define SHARD_METHOD_CHAR_HASH		'h'
+#define SHARD_METHOD_CHAR_RANGE		'r'
 
-extern bool is_sharded_table(Oid tableoid);
-extern char get_shard_method(Oid tableoid);
+extern bool is_sharded_table(Oid relid);
+extern char get_shard_method(Oid relid);
 
 #endif							/* PG_SHARDED_TABLE_H */

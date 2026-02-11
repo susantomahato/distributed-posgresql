@@ -102,6 +102,9 @@
 #include "port/pg_bswap.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
+
+/* Distributed subsystem initialization */
+extern void DistributedInit(void);
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
@@ -933,6 +936,12 @@ PostmasterMain(int argc, char *argv[])
 	 * process any libraries that should be preloaded at postmaster start
 	 */
 	process_shared_preload_libraries();
+
+	/*
+	 * Initialize distributed subsystem (Raft consensus, shard routing).
+	 * Must be after shared_preload_libraries so GUCs are available.
+	 */
+	DistributedInit();
 
 	/*
 	 * Initialize SSL library, if specified.

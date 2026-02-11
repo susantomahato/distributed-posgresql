@@ -162,4 +162,10 @@ extern bool ShardIsActive(int32 shard_id);
 extern bool ShardNodeIsOnline(const char *node_name);
 extern int32 GetShardCount(Oid table_oid);
 
+/*
+ * Helper to get the default hash opclass for a type.
+ * Wraps GetDefaultOpClass(type, HASH_AM_OID).
+ */
+extern Oid get_opclass_for_type(Oid type_oid);
+
 #endif							/* SHARD_H */

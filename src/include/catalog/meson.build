@@ -69,6 +69,11 @@ catalog_headers = [
   'pg_publication_rel.h',
   'pg_subscription.h',
   'pg_subscription_rel.h',
+  'pg_shard_node.h',
+  'pg_shard_map.h',
+  'pg_sharded_table.h',
+  'pg_distributed_transaction.h',
+  'pg_dist_placement.h',
 ]
 
 # The .dat files we need can just be listed alphabetically.
@@ -97,6 +102,11 @@ bki_data = [
   'pg_ts_parser.dat',
   'pg_ts_template.dat',
   'pg_type.dat',
+  'pg_shard_node.dat',
+  'pg_shard_map.dat',
+  'pg_sharded_table.dat',
+  'pg_distributed_transaction.dat',
+  'pg_dist_placement.dat',
 ]
 bki_data_f = files(bki_data)
 

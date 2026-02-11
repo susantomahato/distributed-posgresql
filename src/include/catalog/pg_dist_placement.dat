@@ -1,0 +1,15 @@
+#----------------------------------------------------------------------
+#
+# pg_dist_placement.dat
+#    Initial contents of the pg_dist_placement system catalog.
+#
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+#
+# src/include/catalog/pg_dist_placement.dat
+#
+#----------------------------------------------------------------------
+
+[
+# Placements are created dynamically when distributed tables are created
+# No initial entries required
+]

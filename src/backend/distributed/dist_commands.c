@@ -340,25 +340,45 @@ dist_shard_status(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	/* Scan pg_dist_placement */
-	rel = table_open(DistPlacementRelationId, AccessShareLock);
+	/* Scan pg_shard_map */
+	rel = table_open(ShardMapRelationId, AccessShareLock);
 	scan = systable_beginscan(rel, InvalidOid, false, NULL, 0, NULL);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
-		Form_pg_dist_placement form =
-			(Form_pg_dist_placement) GETSTRUCT(tuple);
-		Datum		values[8];
-		bool		nulls[8] = {false};
+		Form_pg_shard_map form = (Form_pg_shard_map) GETSTRUCT(tuple);
+		TupleDesc	reldesc = RelationGetDescr(rel);
+		Datum		values[6];
+		bool		nulls[6] = {false};
+		Datum		d_hashmin,
+					d_hashmax,
+					d_shardstate;
+		bool		n_hashmin,
+					n_hashmax,
+					n_shardstate;
 
-		values[0] = Int64GetDatum(form->placementid);
-		values[1] = Int32GetDatum(form->shardid);
+		/* shardid, relid, nodename are before varlena — safe via form */
+		values[0] = Int32GetDatum(form->shardid);
+		values[1] = ObjectIdGetDatum(form->relid);
 		values[2] = NameGetDatum(&form->nodename);
-		values[3] = Int32GetDatum(form->raftgroupid);
-		values[4] = CharGetDatum(form->raftrole);
-		values[5] = CharGetDatum(form->placementstate);
-		values[6] = Int64GetDatum(form->raftterm);
-		values[7] = TimestampTzGetDatum(form->createdat);
+
+		/*
+		 * shardstate, hashmin, hashmax are after variable-length
+		 * rangemin/rangemax text fields — must use heap_getattr.
+		 */
+		d_shardstate = heap_getattr(tuple, Anum_pg_shard_map_shardstate,
+									reldesc, &n_shardstate);
+		d_hashmin = heap_getattr(tuple, Anum_pg_shard_map_hashmin,
+								 reldesc, &n_hashmin);
+		d_hashmax = heap_getattr(tuple, Anum_pg_shard_map_hashmax,
+								 reldesc, &n_hashmax);
+
+		values[3] = n_shardstate ? CharGetDatum('\0') : d_shardstate;
+		nulls[3] = n_shardstate;
+		values[4] = n_hashmin ? Int32GetDatum(0) : d_hashmin;
+		nulls[4] = n_hashmin;
+		values[5] = n_hashmax ? Int32GetDatum(0) : d_hashmax;
+		nulls[5] = n_hashmax;
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}

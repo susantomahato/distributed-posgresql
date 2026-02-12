@@ -410,7 +410,6 @@ ShardedTableInfo *
 GetShardedTableInfo(Oid table_oid)
 {
 	HeapTuple	tuple;
-	Form_pg_sharded_table form;
 	ShardedTableInfo *info;
 	Datum		shard_key_datum;
 	bool		isnull;
@@ -423,8 +422,6 @@ GetShardedTableInfo(Oid table_oid)
 	tuple = SearchSysCache1(SHARDEDTABLE, ObjectIdGetDatum(table_oid));
 	if (!HeapTupleIsValid(tuple))
 		return NULL;
-
-	form = (Form_pg_sharded_table) GETSTRUCT(tuple);
 
 	/* Extract shard key column names */
 	shard_key_datum = SysCacheGetAttr(SHARDEDTABLE, tuple,
@@ -450,11 +447,34 @@ GetShardedTableInfo(Oid table_oid)
 		attnums = lappend_int(attnums, attnum);
 	}
 
-	info = MakeShardedTableInfo(table_oid,
-								attnums,
-								(form->shardmethod == SHARD_METHOD_CHAR_HASH) ?
-								SHARD_METHOD_HASH : SHARD_METHOD_RANGE,
-								form->shardcount);
+	/*
+	 * shardmethod and shardcount are after the variable-length shardkey
+	 * text[] field — must use SysCacheGetAttr instead of Form_ access.
+	 */
+	{
+		Datum		method_datum;
+		Datum		count_datum;
+		bool		method_isnull;
+		bool		count_isnull;
+		char		shard_method_char;
+		int32		shard_count_val;
+
+		method_datum = SysCacheGetAttr(SHARDEDTABLE, tuple,
+									   Anum_pg_sharded_table_shardmethod,
+									   &method_isnull);
+		count_datum = SysCacheGetAttr(SHARDEDTABLE, tuple,
+									  Anum_pg_sharded_table_shardcount,
+									  &count_isnull);
+
+		shard_method_char = method_isnull ? '\0' : DatumGetChar(method_datum);
+		shard_count_val = count_isnull ? 0 : DatumGetInt32(count_datum);
+
+		info = MakeShardedTableInfo(table_oid,
+									attnums,
+									(shard_method_char == SHARD_METHOD_CHAR_HASH) ?
+									SHARD_METHOD_HASH : SHARD_METHOD_RANGE,
+									shard_count_val);
+	}
 
 	ReleaseSysCache(tuple);
 
@@ -469,15 +489,21 @@ bool
 ShardIsActive(int32 shard_id)
 {
 	HeapTuple	tuple;
-	Form_pg_shard_map form;
+	Datum		datum;
+	bool		isnull;
 	bool		result;
 
 	tuple = SearchSysCache1(SHARDMAPID, Int32GetDatum(shard_id));
 	if (!HeapTupleIsValid(tuple))
 		return false;
 
-	form = (Form_pg_shard_map) GETSTRUCT(tuple);
-	result = (form->shardstate == SHARD_STATE_CHAR_ACTIVE);
+	/*
+	 * shardstate is after variable-length rangemin/rangemax text fields,
+	 * so we must use SysCacheGetAttr instead of Form_ access.
+	 */
+	datum = SysCacheGetAttr(SHARDMAPID, tuple,
+							Anum_pg_shard_map_shardstate, &isnull);
+	result = (!isnull && DatumGetChar(datum) == SHARD_STATE_CHAR_ACTIVE);
 
 	ReleaseSysCache(tuple);
 

@@ -83,7 +83,8 @@ RaftSendAppendEntries(const char *node_name, AppendEntriesRequest *req)
 
 	result = DistExecSimpleQuery(node_name, query.data);
 
-	if (PQresultStatus(result) == PGRES_TUPLES_OK && PQntuples(result) > 0)
+	if (PQresultStatus(result) == PGRES_TUPLES_OK &&
+		PQntuples(result) > 0 && PQnfields(result) >= 3)
 	{
 		resp.term = atoll(PQgetvalue(result, 0, 0));
 		resp.success = (strcmp(PQgetvalue(result, 0, 1), "t") == 0);
@@ -122,7 +123,8 @@ RaftSendRequestVote(const char *node_name, RequestVoteRequest *req)
 
 	result = DistExecSimpleQuery(node_name, query.data);
 
-	if (PQresultStatus(result) == PGRES_TUPLES_OK && PQntuples(result) > 0)
+	if (PQresultStatus(result) == PGRES_TUPLES_OK &&
+		PQntuples(result) > 0 && PQnfields(result) >= 2)
 	{
 		resp.term = atoll(PQgetvalue(result, 0, 0));
 		resp.vote_granted = (strcmp(PQgetvalue(result, 0, 1), "t") == 0);

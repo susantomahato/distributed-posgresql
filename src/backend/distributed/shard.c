@@ -302,6 +302,68 @@ GetShardForKey(Oid table_oid, Datum shard_key)
 }
 
 /*
+ * GetShardById
+ *		Get a shard map entry by shard ID.
+ *
+ * Returns the ShardMapEntry, or NULL if not found.
+ */
+ShardMapEntry *
+GetShardById(int32 shard_id)
+{
+	Relation	shard_map_rel;
+	SysScanDesc scan;
+	ScanKeyData skey[1];
+	HeapTuple	tuple;
+	ShardMapEntry *result = NULL;
+
+	shard_map_rel = table_open(ShardMapRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_shard_map_shardid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(shard_id));
+
+	scan = systable_beginscan(shard_map_rel, ShardMapShardidIndexId,
+							   true, NULL, 1, skey);
+
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_shard_map form = (Form_pg_shard_map) GETSTRUCT(tuple);
+		TupleDesc	map_desc = RelationGetDescr(shard_map_rel);
+		ShardMethod method;
+		Datum		d_hashmin,
+					d_hashmax;
+		bool		n_hashmin,
+					n_hashmax;
+
+		method = (form->shardmethod == SHARD_METHOD_CHAR_HASH) ?
+			SHARD_METHOD_HASH : SHARD_METHOD_RANGE;
+
+		result = MakeShardMapEntry(form->shardid,
+								   form->relid,
+								   NameStr(form->nodename),
+								   method);
+
+		d_hashmin = heap_getattr(tuple, Anum_pg_shard_map_hashmin,
+								 map_desc, &n_hashmin);
+		d_hashmax = heap_getattr(tuple, Anum_pg_shard_map_hashmax,
+								 map_desc, &n_hashmax);
+
+		if (method == SHARD_METHOD_HASH)
+		{
+			result->hash_min = n_hashmin ? 0 : DatumGetInt32(d_hashmin);
+			result->hash_max = n_hashmax ? 0 : DatumGetInt32(d_hashmax);
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(shard_map_rel, AccessShareLock);
+
+	return result;
+}
+
+/*
  * GetAllShardsForTable
  *		Get all shards for a given table
  *

@@ -34,6 +34,7 @@
 #include "catalog/pg_dist_placement.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -41,10 +42,24 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
+/* Forward declarations */
+static void PropagateMetadataToNodes(Oid table_oid, const char *table_name,
+									 const char *shard_key_col,
+									 int shard_count, int replication_factor,
+									 int32 hash_range_size,
+									 char **node_names, int num_nodes);
+
 PG_FUNCTION_INFO_V1(create_distributed_table);
 PG_FUNCTION_INFO_V1(dist_rebalance_shards);
 PG_FUNCTION_INFO_V1(dist_shard_status);
 PG_FUNCTION_INFO_V1(dist_raft_status);
+
+/*
+ * Guard against recursive metadata propagation.
+ * When we call create_distributed_table on a remote node, that node
+ * should NOT try to propagate back to us.
+ */
+/* dist_propagating is now a GUC variable (distributed.propagating) */
 
 /*
  * create_distributed_table(table_name regclass, shard_key text,
@@ -279,6 +294,28 @@ CreateDistributedTableInternal(Oid table_oid, const char *shard_key_col,
 
 	CommandCounterIncrement();
 
+	/*
+	 * Propagate metadata to all remote nodes so they know about this
+	 * distributed table, its shard map, and placements.
+	 * Skip if we're already propagating (to avoid infinite recursion).
+	 */
+	if (!dist_propagating)
+	{
+		dist_propagating = true;
+		PG_TRY();
+		{
+			PropagateMetadataToNodes(table_oid, get_rel_name(table_oid),
+									 shard_key_col, shard_count,
+									 replication_factor, hash_range_size,
+									 node_names, num_nodes);
+		}
+		PG_FINALLY();
+		{
+			dist_propagating = false;
+		}
+		PG_END_TRY();
+	}
+
 	elog(LOG, "distributed: created distributed table (oid=%u) with "
 		 "%d shards, replication_factor=%d",
 		 table_oid, shard_count, replication_factor);
@@ -444,4 +481,142 @@ dist_raft_status(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 
 	return (Datum) 0;
+}
+
+/*
+ * PropagateMetadataToNodes
+ *		Propagate distributed table metadata to all remote nodes.
+ *
+ * After creating the distributed table locally, we need all other
+ * nodes to know about:
+ *   1. The table itself (CREATE TABLE IF NOT EXISTS)
+ *   2. The pg_sharded_table entry
+ *   3. The pg_shard_map entries
+ *   4. The pg_dist_placement entries
+ *
+ * We send the equivalent catalog INSERT statements as SQL over libpq.
+ * Each remote node receives and executes these statements so that
+ * its catalog state matches the coordinator.
+ */
+static void
+PropagateMetadataToNodes(Oid table_oid, const char *table_name,
+						 const char *shard_key_col,
+						 int shard_count, int replication_factor,
+						 int32 hash_range_size,
+						 char **node_names, int num_nodes)
+{
+	StringInfoData create_ddl;
+	StringInfoData cmd;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			natts;
+	int			node_idx;
+	int			i;
+
+	if (table_name == NULL)
+	{
+		elog(WARNING, "distributed: cannot propagate metadata, "
+			 "table name is NULL");
+		return;
+	}
+
+	/*
+	 * Build CREATE TABLE IF NOT EXISTS from the table's tuple descriptor.
+	 * This gives remote nodes the table structure.
+	 */
+	rel = table_open(table_oid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	natts = tupdesc->natts;
+
+	initStringInfo(&create_ddl);
+	appendStringInfo(&create_ddl,
+					 "CREATE TABLE IF NOT EXISTS %s (",
+					 table_name);
+
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		if (att->attisdropped)
+			continue;
+
+		if (i > 0)
+			appendStringInfoString(&create_ddl, ", ");
+
+		appendStringInfo(&create_ddl, "%s %s",
+						 NameStr(att->attname),
+						 format_type_with_typemod(att->atttypid,
+												  att->atttypmod));
+
+		if (att->attnotnull)
+			appendStringInfoString(&create_ddl, " NOT NULL");
+	}
+
+	appendStringInfoChar(&create_ddl, ')');
+	table_close(rel, AccessShareLock);
+
+	/*
+	 * Build the create_distributed_table call for remote nodes.
+	 * Remote nodes will execute the same function which populates
+	 * their local catalogs (pg_sharded_table, pg_shard_map,
+	 * pg_dist_placement) and initializes Raft groups in shmem.
+	 */
+	initStringInfo(&cmd);
+
+	/*
+	 * Send CREATE TABLE + create_distributed_table to each remote node.
+	 * We send the DDL first so the table exists, then call
+	 * create_distributed_table with the same parameters.
+	 */
+	for (node_idx = 0; node_idx < num_nodes; node_idx++)
+	{
+		if (IsLocalNode(node_names[node_idx]))
+			continue;
+
+		PG_TRY();
+		{
+			PGresult   *result;
+
+			/* Step 1: Create the table on the remote node */
+			result = DistExecSimpleQuery(node_names[node_idx],
+										 create_ddl.data);
+			PQclear(result);
+
+			/*
+			 * Step 2: Set distributed.propagating = on to prevent
+			 * recursive propagation from the remote node.
+			 */
+			result = DistExecSimpleQuery(node_names[node_idx],
+										 "SET distributed.propagating = on");
+			PQclear(result);
+
+			/*
+			 * Step 3: Call create_distributed_table on the remote node.
+			 * This populates the remote node's catalogs identically.
+			 */
+			resetStringInfo(&cmd);
+			appendStringInfo(&cmd,
+							 "SELECT create_distributed_table('%s'::regclass, "
+							 "'%s', %d, %d)",
+							 table_name, shard_key_col,
+							 shard_count, replication_factor);
+
+			result = DistExecSimpleQuery(node_names[node_idx], cmd.data);
+			PQclear(result);
+
+			elog(DEBUG1, "distributed: propagated metadata to node \"%s\"",
+				 node_names[node_idx]);
+		}
+		PG_CATCH();
+		{
+			elog(WARNING, "distributed: failed to propagate metadata "
+				 "to node \"%s\"",
+				 node_names[node_idx]);
+			FlushErrorState();
+		}
+		PG_END_TRY();
+	}
+
+	pfree(create_ddl.data);
+	pfree(cmd.data);
 }

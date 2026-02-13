@@ -170,8 +170,14 @@ dist_executor_run_wrapper(QueryDesc *queryDesc,
 {
 	if (dist_enabled)
 	{
+		/*
+		 * DistExecutorRunHook handles all execution internally
+		 * (local, remote forward, or scatter-gather) and calls
+		 * standard_ExecutorRun when appropriate. We don't chain
+		 * to prev hooks because the distributed hook fully owns
+		 * execution for distributed queries.
+		 */
 		DistExecutorRunHook(queryDesc, direction, count);
-		/* If the hook handled the query completely, don't run standard */
 		return;
 	}
 

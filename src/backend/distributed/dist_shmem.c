@@ -27,6 +27,10 @@
 /* Global pointer */
 DistributedShmemState *DistShmem = NULL;
 
+/* Tranche IDs for our LWLocks */
+static int	dist_shmem_tranche_id = 0;
+static int	raft_group_tranche_id = 0;
+
 /*
  * DistributedShmemSize
  *		Calculate shared memory needed for the distributed subsystem.
@@ -60,6 +64,12 @@ DistShmemStartupHook(void)
 	if (!dist_enabled)
 		return;
 
+	/* Allocate and register our LWLock tranches */
+	if (dist_shmem_tranche_id == 0)
+		dist_shmem_tranche_id = LWLockNewTrancheId("DistributedShmemLock");
+	if (raft_group_tranche_id == 0)
+		raft_group_tranche_id = LWLockNewTrancheId("RaftGroupLock");
+
 	DistShmem = (DistributedShmemState *)
 		ShmemInitStruct("Distributed Shmem State",
 						DistributedShmemSize(),
@@ -69,7 +79,7 @@ DistShmemStartupHook(void)
 	{
 		/* First time — initialize everything */
 		memset(DistShmem, 0, sizeof(DistributedShmemState));
-		LWLockInitialize(&DistShmem->lock, LWTRANCHE_FIRST_USER_DEFINED);
+		LWLockInitialize(&DistShmem->lock, dist_shmem_tranche_id);
 		DistShmem->initialized = true;
 		DistShmem->num_raft_groups = 0;
 		DistShmem->num_nodes = 0;
@@ -80,7 +90,7 @@ DistShmemStartupHook(void)
 			DistShmem->raft_groups[i].in_use = false;
 			SpinLockInit(&DistShmem->raft_groups[i].mutex);
 			LWLockInitialize(&DistShmem->raft_groups[i].raft_lock,
-							 LWTRANCHE_FIRST_USER_DEFINED + 1);
+							 raft_group_tranche_id);
 		}
 
 		/* Initialize node health slots */
@@ -162,7 +172,7 @@ DistShmemAllocRaftGroup(int raft_group_id, int shard_id)
 			group->last_heartbeat = GetCurrentTimestamp();
 			SpinLockInit(&group->mutex);
 			LWLockInitialize(&group->raft_lock,
-							 LWTRANCHE_FIRST_USER_DEFINED + 1);
+							 raft_group_tranche_id);
 
 			DistShmem->num_raft_groups++;
 

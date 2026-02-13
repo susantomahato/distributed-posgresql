@@ -28,6 +28,7 @@
 #include "distributed/raft_log.h"
 #include "distributed/raft_rpc.h"
 #include "common/pg_prng.h"
+#include "executor/spi.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -382,6 +383,11 @@ RaftStepDown(RaftGroupState *group, int64 new_term)
  * RaftApplyCommitted
  *		Apply all committed but not yet applied log entries.
  *
+ * For followers, this executes the SQL commands that were replicated
+ * through Raft consensus.  For leaders, the SQL was already executed
+ * by the executor hook, so we skip re-execution and just advance
+ * last_applied.
+ *
  * Entries are executed via SPI within the background worker.
  */
 void
@@ -411,11 +417,70 @@ RaftApplyCommitted(RaftGroupState *group)
 				 entry->sql_cmd ? entry->sql_cmd : "(null)");
 
 			/*
-			 * In a full implementation, we would execute the SQL command
-			 * via SPI here. For now, we just advance last_applied.
-			 *
-			 * TODO: SPI_connect() + SPI_exec(entry->sql_cmd) + SPI_finish()
+			 * Execute the SQL command via SPI on followers.
+			 * Leaders already executed the write locally via the
+			 * executor hook, so they skip re-execution.
 			 */
+			if (group->role != RAFT_ROLE_LEADER &&
+				entry->sql_cmd != NULL &&
+				entry->sql_cmd[0] != '\0')
+			{
+				int			spi_ret;
+
+				PG_TRY();
+				{
+					spi_ret = SPI_connect();
+					if (spi_ret != SPI_OK_CONNECT)
+					{
+						elog(WARNING, "raft: group %d SPI_connect failed "
+							 "(ret=%d) for entry %lld",
+							 group->raft_group_id, spi_ret,
+							 (long long) apply_index);
+					}
+					else
+					{
+						spi_ret = SPI_execute(entry->sql_cmd, false, 0);
+						if (spi_ret < 0)
+						{
+							elog(WARNING, "raft: group %d SPI_execute "
+								 "failed (ret=%d) for entry %lld: %s",
+								 group->raft_group_id, spi_ret,
+								 (long long) apply_index,
+								 entry->sql_cmd);
+						}
+						else
+						{
+							elog(DEBUG1, "raft: group %d applied entry "
+								 "%lld via SPI (%lld rows affected)",
+								 group->raft_group_id,
+								 (long long) apply_index,
+								 (long long) SPI_processed);
+						}
+						SPI_finish();
+					}
+				}
+				PG_CATCH();
+				{
+					elog(WARNING, "raft: group %d failed to apply "
+						 "entry %lld: %s",
+						 group->raft_group_id,
+						 (long long) apply_index,
+						 entry->sql_cmd ? entry->sql_cmd : "(null)");
+					FlushErrorState();
+
+					/* Try to clean up SPI */
+					PG_TRY();
+					{
+						SPI_finish();
+					}
+					PG_CATCH();
+					{
+						FlushErrorState();
+					}
+					PG_END_TRY();
+				}
+				PG_END_TRY();
+			}
 		}
 
 		SpinLockAcquire(&group->mutex);

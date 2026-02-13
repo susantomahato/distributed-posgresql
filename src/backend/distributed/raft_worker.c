@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "distributed/dist_guc.h"
 #include "distributed/dist_node.h"
 #include "distributed/dist_shmem.h"
@@ -118,43 +119,53 @@ RaftWorkerMain(Datum main_arg)
 		if (DistShmem == NULL || !DistShmem->initialized)
 			continue;
 
-		/* Tick all active Raft groups on this node */
-		for (int i = 0; i < MAX_RAFT_GROUPS; i++)
+		/*
+		 * Tick all active Raft groups on this node.
+		 * We need a transaction context for catalog access
+		 * (e.g., looking up connection info for RPC).
+		 */
+		PG_TRY();
 		{
-			RaftGroupState *group = &DistShmem->raft_groups[i];
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
 
-			if (!group->in_use)
-				continue;
-
-			/* Only tick groups where this node is a member */
+			for (int i = 0; i < MAX_RAFT_GROUPS; i++)
 			{
-				bool		is_member = false;
+				RaftGroupState *group = &DistShmem->raft_groups[i];
 
-				for (int j = 0; j < group->num_peers; j++)
+				if (!group->in_use)
+					continue;
+
+				/* Only tick groups where this node is a member */
 				{
-					if (IsLocalNode(group->peer_names[j]))
+					bool		is_member = false;
+
+					for (int j = 0; j < group->num_peers; j++)
 					{
-						is_member = true;
-						break;
+						if (IsLocalNode(group->peer_names[j]))
+						{
+							is_member = true;
+							break;
+						}
 					}
+
+					if (!is_member)
+						continue;
 				}
 
-				if (!is_member)
-					continue;
-			}
-
-			PG_TRY();
-			{
 				RaftGroupTick(group);
 			}
-			PG_CATCH();
-			{
-				elog(WARNING, "distributed: error ticking raft group %d",
-					 group->raft_group_id);
-				FlushErrorState();
-			}
-			PG_END_TRY();
+
+			PopActiveSnapshot();
+			CommitTransactionCommand();
 		}
+		PG_CATCH();
+		{
+			elog(WARNING, "distributed: raft tick error");
+			FlushErrorState();
+			AbortCurrentTransaction();
+		}
+		PG_END_TRY();
 	}
 
 	elog(LOG, "distributed: raft worker shutting down");

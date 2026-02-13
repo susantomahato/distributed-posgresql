@@ -15,6 +15,7 @@
  */
 #include "postgres.h"
 
+#include "distributed/dist_connection.h"
 #include "distributed/dist_guc.h"
 #include "distributed/dist_node.h"
 #include "distributed/dist_shmem.h"
@@ -28,11 +29,15 @@
 #include "distributed/shard.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "libpq-fe.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+
+/* Guard against recursive node propagation */
+static bool dist_node_propagating = false;
 
 PG_FUNCTION_INFO_V1(dist_add_node);
 PG_FUNCTION_INFO_V1(dist_remove_node);
@@ -189,6 +194,127 @@ AddDistNode(const char *node_name, const char *conninfo)
 	DistShmemUpdateNodeHealth(node_name, GetCurrentTimestamp());
 
 	CommandCounterIncrement();
+
+	/*
+	 * Propagate node membership to all cluster nodes so every node
+	 * has the same view of the cluster.
+	 *
+	 * We use direct INSERT INTO pg_shard_node on remote nodes (bypassing
+	 * their dist_add_node function) to avoid cross-node propagation
+	 * deadlocks. This is safe because only the coordinator (the node
+	 * where dist_add_node is originally called) does propagation.
+	 */
+	if (!dist_node_propagating && !IsLocalNode(node_name))
+	{
+		List	   *all_nodes;
+		ListCell   *lc;
+
+		dist_node_propagating = true;
+
+		PG_TRY();
+		{
+			all_nodes = GetAllDistNodes();
+
+			/*
+			 * Tell each existing remote node about the new node
+			 * via direct catalog INSERT.
+			 */
+			foreach(lc, all_nodes)
+			{
+				char	   *other = (char *) lfirst(lc);
+
+				if (IsLocalNode(other) ||
+					strcmp(other, node_name) == 0)
+					continue;
+
+				PG_TRY();
+				{
+					StringInfoData cmd;
+					PGresult   *result;
+
+					initStringInfo(&cmd);
+					appendStringInfo(&cmd,
+									 "DO $$ BEGIN "
+									 "IF NOT EXISTS (SELECT 1 FROM pg_shard_node "
+									 "WHERE nodename = '%s') THEN "
+									 "INSERT INTO pg_shard_node "
+									 "(nodename, nodeconnstr, nodestate, "
+									 "shardcount, lasthealthcheck, createdat) "
+									 "VALUES ('%s', '%s', 'o', 0, now(), now()); "
+									 "END IF; END $$",
+									 node_name, node_name, conninfo);
+					result = DistExecSimpleQuery(other, cmd.data);
+					PQclear(result);
+				}
+				PG_CATCH();
+				{
+					elog(WARNING, "distributed: failed to tell node "
+						 "\"%s\" about new node \"%s\"",
+						 other, node_name);
+					FlushErrorState();
+				}
+				PG_END_TRY();
+			}
+
+			/*
+			 * Tell the new node about all existing nodes
+			 * (including itself) via direct catalog INSERT.
+			 */
+			foreach(lc, all_nodes)
+			{
+				char	   *other = (char *) lfirst(lc);
+				char	   *other_conninfo;
+
+				/*
+				 * For the new node itself, use the conninfo we
+				 * already have.  For others, look it up.
+				 */
+				if (strcmp(other, node_name) == 0)
+					other_conninfo = pstrdup(conninfo);
+				else
+				{
+					other_conninfo = GetNodeConnInfo(other);
+					if (other_conninfo == NULL)
+						continue;
+				}
+
+				PG_TRY();
+				{
+					StringInfoData cmd;
+					PGresult   *result;
+
+					initStringInfo(&cmd);
+					appendStringInfo(&cmd,
+									 "DO $$ BEGIN "
+									 "IF NOT EXISTS (SELECT 1 FROM pg_shard_node "
+									 "WHERE nodename = '%s') THEN "
+									 "INSERT INTO pg_shard_node "
+									 "(nodename, nodeconnstr, nodestate, "
+									 "shardcount, lasthealthcheck, createdat) "
+									 "VALUES ('%s', '%s', 'o', 0, now(), now()); "
+									 "END IF; END $$",
+									 other, other, other_conninfo);
+					result = DistExecSimpleQuery(node_name, cmd.data);
+					PQclear(result);
+				}
+				PG_CATCH();
+				{
+					elog(WARNING, "distributed: failed to tell new node "
+						 "\"%s\" about existing node \"%s\"",
+						 node_name, other);
+					FlushErrorState();
+				}
+				PG_END_TRY();
+			}
+
+			list_free_deep(all_nodes);
+		}
+		PG_FINALLY();
+		{
+			dist_node_propagating = false;
+		}
+		PG_END_TRY();
+	}
 
 	elog(LOG, "distributed: added node \"%s\"", node_name);
 }

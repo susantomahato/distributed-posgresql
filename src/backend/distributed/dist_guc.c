@@ -26,6 +26,7 @@ int			dist_election_timeout_min_ms = 3000;
 int			dist_election_timeout_max_ms = 5000;
 int			dist_raft_tick_interval_ms = 50;
 bool		dist_allow_stale_reads = false;
+bool		dist_propagating = false;
 
 /*
  * DistributedGucInit
@@ -122,6 +123,15 @@ DistributedGucInit(void)
 							 "Allow reads from follower replicas (eventual consistency).",
 							 NULL,
 							 &dist_allow_stale_reads,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("distributed.propagating",
+							 "Set to true to skip metadata propagation (internal use).",
+							 NULL,
+							 &dist_propagating,
 							 false,
 							 PGC_USERSET,
 							 0,

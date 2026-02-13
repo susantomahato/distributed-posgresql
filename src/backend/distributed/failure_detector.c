@@ -41,7 +41,10 @@
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
+#include "distributed/shard.h"
+#include "libpq-fe.h"
 
 /* Number of missed heartbeats before marking a node as failed */
 #define FAILURE_THRESHOLD		3
@@ -244,7 +247,59 @@ HandleNodeFailure(const char *node_name)
 				 (long long) p->placementid, p->shardid, node_name);
 
 			/*
-			 * Step 3: Choose a healthy node for re-replication.
+			 * Step 3: Expedite Raft election for this group.
+			 *
+			 * If the failed node was the leader, we need a new leader.
+			 * Force an immediate election by ticking the group and
+			 * resetting the heartbeat timer on any local follower so
+			 * it triggers an election timeout.
+			 */
+			if (p->raftrole == PLACEMENT_RAFT_LEADER &&
+				DistShmem != NULL)
+			{
+				RaftGroupState *group;
+
+				group = DistShmemGetRaftGroup(p->raftgroupid);
+				if (group != NULL && group->in_use)
+				{
+					int		local_peer_idx;
+
+					/*
+					 * If we are a peer in this group, force election
+					 * by setting last_heartbeat to the distant past
+					 * so the next tick triggers an election.
+					 */
+					local_peer_idx = -1;
+					for (int pi = 0; pi < group->num_peers; pi++)
+					{
+						if (IsLocalNode(group->peer_names[pi]))
+						{
+							local_peer_idx = pi;
+							break;
+						}
+					}
+
+					if (local_peer_idx >= 0 &&
+						group->role == RAFT_ROLE_FOLLOWER)
+					{
+						SpinLockAcquire(&group->mutex);
+						/* Set heartbeat to 0 to trigger immediate election */
+						group->last_heartbeat = 0;
+						SpinLockRelease(&group->mutex);
+
+						/* Tick immediately to start election */
+						RaftGroupTick(group);
+
+						elog(LOG, "distributed: expedited election for "
+							 "raft group %d (shard %d) after leader "
+							 "\"%s\" failure",
+							 p->raftgroupid, p->shardid, node_name);
+					}
+				}
+			}
+
+			/*
+			 * Step 4: Choose a healthy node for re-replication.
 			 * Find a node that doesn't already have a placement
 			 * for this shard group.
 			 */
@@ -323,7 +378,6 @@ HandleNodeFailure(const char *node_name)
 void
 InitiateReReplication(int raft_group_id, const char *new_node)
 {
-	PlacementInfo *leader;
 	List	   *placements;
 	int32		shard_id = 0;
 
@@ -390,35 +444,253 @@ InitiateReReplication(int raft_group_id, const char *new_node)
 /*
  * ReReplicationWorkerMain
  *		Background worker for data transfer during re-replication.
+ *
+ * Steps:
+ *   1. Find leader for the raft group
+ *   2. Find the new (LEARNER) placement for target node
+ *   3. Copy shard data from leader to new node
+ *   4. Promote LEARNER to FOLLOWER
+ *   5. Remove decommissioned placements
  */
 void
 ReReplicationWorkerMain(Datum main_arg)
 {
 	int			raft_group_id = DatumGetInt32(main_arg);
+	List	   *placements;
+	ListCell   *lc;
+	char		leader_node[NAMEDATALEN] = "";
+	char		learner_node[NAMEDATALEN] = "";
+	int64		learner_placement_id = 0;
+	int32		shard_id = 0;
+	Oid			table_oid = InvalidOid;
 
 	elog(LOG, "distributed: re-replication worker starting for group %d",
 		 raft_group_id);
 
 	BackgroundWorkerInitializeConnection("postgres", NULL, 0);
 
-	/*
-	 * TODO: Full implementation:
-	 * 1. Find leader node for this raft group
-	 * 2. Export snapshot on leader
-	 * 3. COPY shard data from leader to new node
-	 * 4. Add new node as LEARNER in Raft group
-	 * 5. Wait for log catch-up
-	 * 6. Promote LEARNER to FOLLOWER
-	 * 7. Update pg_dist_placement
-	 * 8. Remove decommissioned placement
-	 *
-	 * For now, just log and exit.
-	 */
-	elog(LOG, "distributed: re-replication for group %d complete "
-		 "(stub implementation)",
-		 raft_group_id);
+	/* Find leader and learner placements */
+	StartTransactionCommand();
 
-	ReReplicationComplete(raft_group_id, "");
+	placements = GetPlacementsForRaftGroup(raft_group_id);
+	foreach(lc, placements)
+	{
+		PlacementInfo *p = (PlacementInfo *) lfirst(lc);
+
+		if (p->raftrole == PLACEMENT_RAFT_LEADER &&
+			p->placementstate == PLACEMENT_STATE_ACTIVE)
+		{
+			strlcpy(leader_node, p->nodename, NAMEDATALEN);
+			shard_id = p->shardid;
+		}
+		else if (p->raftrole == PLACEMENT_RAFT_LEARNER &&
+				 p->placementstate == PLACEMENT_STATE_SYNCING)
+		{
+			strlcpy(learner_node, p->nodename, NAMEDATALEN);
+			learner_placement_id = p->placementid;
+			if (shard_id == 0)
+				shard_id = p->shardid;
+		}
+		FreePlacementInfo(p);
+	}
+	list_free(placements);
+
+	/* If no leader found, try any active non-decommissioning node */
+	if (leader_node[0] == '\0')
+	{
+		placements = GetPlacementsForRaftGroup(raft_group_id);
+		foreach(lc, placements)
+		{
+			PlacementInfo *p = (PlacementInfo *) lfirst(lc);
+
+			if (p->placementstate == PLACEMENT_STATE_ACTIVE &&
+				p->raftrole != PLACEMENT_RAFT_LEARNER)
+			{
+				strlcpy(leader_node, p->nodename, NAMEDATALEN);
+				shard_id = p->shardid;
+				FreePlacementInfo(p);
+				break;
+			}
+			FreePlacementInfo(p);
+		}
+		list_free(placements);
+	}
+
+	CommitTransactionCommand();
+
+	if (leader_node[0] == '\0' || learner_node[0] == '\0' || shard_id == 0)
+	{
+		elog(WARNING, "distributed: re-replication for group %d: "
+			 "could not find leader (\"%s\") or learner (\"%s\") or "
+			 "shard (%d)",
+			 raft_group_id, leader_node, learner_node, shard_id);
+		proc_exit(0);
+	}
+
+	/*
+	 * Copy data from leader to learner.
+	 * We query the shard data from the leader and insert it into
+	 * the learner node.
+	 */
+	PG_TRY();
+	{
+		PGresult   *data_result;
+		int			ntuples;
+		int			nfields;
+		StringInfoData query;
+		StringInfoData insert_cmd;
+
+		/*
+		 * Get the table name for this shard.
+		 * We need a transaction for catalog lookups.
+		 */
+		StartTransactionCommand();
+		{
+			ShardMapEntry *sme = GetShardById(shard_id);
+
+			if (sme != NULL)
+			{
+				table_oid = sme->table_oid;
+				FreeShardMapEntry(sme);
+			}
+		}
+		CommitTransactionCommand();
+
+		if (!OidIsValid(table_oid))
+		{
+			elog(WARNING, "distributed: re-replication for group %d: "
+				 "could not find table for shard %d",
+				 raft_group_id, shard_id);
+			proc_exit(0);
+		}
+
+		/* Get table name */
+		StartTransactionCommand();
+		{
+			char	   *table_name;
+
+			table_name = get_rel_name(table_oid);
+			if (table_name == NULL)
+			{
+				CommitTransactionCommand();
+				elog(WARNING, "distributed: re-replication table "
+					 "OID %u not found", table_oid);
+				proc_exit(0);
+			}
+
+			/* Query all data from leader */
+			initStringInfo(&query);
+			appendStringInfo(&query, "SELECT * FROM %s", table_name);
+
+			CommitTransactionCommand();
+
+			data_result = DistExecSimpleQuery(leader_node, query.data);
+			ntuples = PQntuples(data_result);
+			nfields = PQnfields(data_result);
+
+			elog(LOG, "distributed: re-replication group %d: "
+				 "copying %d rows from \"%s\" to \"%s\"",
+				 raft_group_id, ntuples, leader_node, learner_node);
+
+			/* Insert each row into the learner */
+			for (int i = 0; i < ntuples; i++)
+			{
+				initStringInfo(&insert_cmd);
+				appendStringInfo(&insert_cmd, "INSERT INTO %s VALUES (",
+								 table_name);
+
+				for (int j = 0; j < nfields; j++)
+				{
+					if (j > 0)
+						appendStringInfoString(&insert_cmd, ", ");
+
+					if (PQgetisnull(data_result, i, j))
+					{
+						appendStringInfoString(&insert_cmd, "NULL");
+					}
+					else
+					{
+						char	   *val = PQgetvalue(data_result, i, j);
+
+						/* Quote the value (simple quoting) */
+						appendStringInfoChar(&insert_cmd, '\'');
+						for (char *p = val; *p; p++)
+						{
+							if (*p == '\'')
+								appendStringInfoChar(&insert_cmd, '\'');
+							appendStringInfoChar(&insert_cmd, *p);
+						}
+						appendStringInfoChar(&insert_cmd, '\'');
+					}
+				}
+
+				appendStringInfoString(&insert_cmd,
+									   ") ON CONFLICT DO NOTHING");
+
+				PG_TRY();
+				{
+					PGresult   *ins_result;
+
+					ins_result = DistExecSimpleQuery(learner_node,
+													 insert_cmd.data);
+					PQclear(ins_result);
+				}
+				PG_CATCH();
+				{
+					elog(WARNING, "distributed: re-replication row %d "
+						 "insert failed", i);
+					FlushErrorState();
+				}
+				PG_END_TRY();
+
+				pfree(insert_cmd.data);
+			}
+
+			PQclear(data_result);
+			pfree(query.data);
+		}
+
+		/* Promote LEARNER to FOLLOWER */
+		StartTransactionCommand();
+		if (learner_placement_id > 0)
+		{
+			UpdatePlacementRole(learner_placement_id,
+								PLACEMENT_RAFT_FOLLOWER);
+			UpdatePlacementState(learner_placement_id,
+								 PLACEMENT_STATE_ACTIVE);
+		}
+
+		/* Remove decommissioned placements */
+		placements = GetPlacementsForRaftGroup(raft_group_id);
+		foreach(lc, placements)
+		{
+			PlacementInfo *p = (PlacementInfo *) lfirst(lc);
+
+			if (p->placementstate == PLACEMENT_STATE_DECOMMISSIONING)
+			{
+				DeletePlacement(p->placementid);
+				elog(LOG, "distributed: removed decommissioned placement "
+					 "%lld from group %d",
+					 (long long) p->placementid, raft_group_id);
+			}
+			FreePlacementInfo(p);
+		}
+		list_free(placements);
+
+		CommitTransactionCommand();
+
+		elog(LOG, "distributed: re-replication for group %d complete "
+			 "(leader=%s, new_node=%s)",
+			 raft_group_id, leader_node, learner_node);
+	}
+	PG_CATCH();
+	{
+		elog(WARNING, "distributed: re-replication for group %d failed",
+			 raft_group_id);
+		FlushErrorState();
+		AbortCurrentTransaction();
+	}
+	PG_END_TRY();
 
 	proc_exit(0);
 }

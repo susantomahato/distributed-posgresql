@@ -27,6 +27,7 @@ int			dist_election_timeout_max_ms = 5000;
 int			dist_raft_tick_interval_ms = 50;
 bool		dist_allow_stale_reads = false;
 bool		dist_propagating = false;
+bool		dist_forwarded = false;
 
 /*
  * DistributedGucInit
@@ -132,6 +133,15 @@ DistributedGucInit(void)
 							 "Set to true to skip metadata propagation (internal use).",
 							 NULL,
 							 &dist_propagating,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("distributed.forwarded",
+							 "Set to true on forwarded queries to prevent re-distribution.",
+							 NULL,
+							 &dist_forwarded,
 							 false,
 							 PGC_USERSET,
 							 0,

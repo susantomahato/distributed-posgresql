@@ -101,8 +101,8 @@ UpdatePlacementRole(int64 placement_id, char new_role)
 
 	ScanKeyInit(&skey[0],
 				Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(placement_id));
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) placement_id));
 
 	scan = systable_beginscan(rel, DistPlacementPlacementidIndexId,
 							  true, NULL, 1, skey);
@@ -150,8 +150,8 @@ UpdatePlacementState(int64 placement_id, char new_state)
 
 	ScanKeyInit(&skey[0],
 				Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(placement_id));
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) placement_id));
 
 	scan = systable_beginscan(rel, DistPlacementPlacementidIndexId,
 							  true, NULL, 1, skey);
@@ -200,8 +200,8 @@ UpdatePlacementTerm(int64 placement_id, int64 new_term)
 
 	ScanKeyInit(&skey[0],
 				Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(placement_id));
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) placement_id));
 
 	scan = systable_beginscan(rel, DistPlacementPlacementidIndexId,
 							  true, NULL, 1, skey);
@@ -245,8 +245,8 @@ DeletePlacement(int64 placement_id)
 
 	ScanKeyInit(&skey[0],
 				Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(placement_id));
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) placement_id));
 
 	scan = systable_beginscan(rel, DistPlacementPlacementidIndexId,
 							  true, NULL, 1, skey);
@@ -396,8 +396,8 @@ GetPlacementById(int64 placement_id)
 
 	ScanKeyInit(&skey[0],
 				Anum_pg_dist_placement_placementid,
-				BTEqualStrategyNumber, F_INT8EQ,
-				Int64GetDatum(placement_id));
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum((int32) placement_id));
 
 	scan = systable_beginscan(rel, DistPlacementPlacementidIndexId,
 							  true, NULL, 1, skey);

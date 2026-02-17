@@ -86,15 +86,14 @@ FailureDetectorWorkerMain(Datum main_arg)
 
 		PG_TRY();
 		{
-			StartTransactionCommand();
 			FailureDetectorCheck();
-			CommitTransactionCommand();
 		}
 		PG_CATCH();
 		{
 			elog(WARNING, "distributed: failure detector error");
 			FlushErrorState();
-			AbortCurrentTransaction();
+			if (IsTransactionState())
+				AbortCurrentTransaction();
 		}
 		PG_END_TRY();
 	}
@@ -104,52 +103,130 @@ FailureDetectorWorkerMain(Datum main_arg)
 }
 
 /*
+ * PingNodeDirect
+ *		Test if a node is reachable using PQping (no ereport on failure).
+ *
+ * This function never throws an error. Returns true if the node
+ * is accepting connections, false otherwise.
+ */
+static bool
+PingNodeDirect(const char *node_name, const char *conninfo)
+{
+	PGPing		ping_result;
+
+	if (conninfo == NULL || conninfo[0] == '\0')
+		return false;
+
+	ping_result = PQping(conninfo);
+	return (ping_result == PQPING_OK);
+}
+
+/*
  * FailureDetectorCheck
  *		Send heartbeat pings to all nodes and handle failures.
+ *
+ * This function manages its own transactions to ensure catalog
+ * operations are always done in a clean transaction state.
  */
 void
 FailureDetectorCheck(void)
 {
-	List	   *nodes;
-	ListCell   *lc;
+	char		node_names[MAX_DIST_NODES][NAMEDATALEN];
+	char		node_conninfos[MAX_DIST_NODES][256];
+	int			num_nodes = 0;
+	char		failed_nodes[MAX_DIST_NODES][NAMEDATALEN];
+	char		recovered_nodes[MAX_DIST_NODES][NAMEDATALEN];
+	int			num_failed = 0;
+	int			num_recovered = 0;
 
-	nodes = GetAllDistNodes();
-
-	foreach(lc, nodes)
+	/*
+	 * Phase 1: Read node list from catalog.
+	 * Copy names and conninfo to local arrays so we don't need a
+	 * transaction during the ping phase.
+	 */
+	StartTransactionCommand();
 	{
-		char	   *node_name = (char *) lfirst(lc);
-		NodeHealthState *health;
+		List	   *nodes;
+		ListCell   *lc;
 
-		/* Skip self */
-		if (IsLocalNode(node_name))
-			continue;
+		nodes = GetAllDistNodes();
 
-		/* Try to ping the node */
-		PG_TRY();
+		foreach(lc, nodes)
 		{
-			PGresult   *result;
+			char	   *node_name = (char *) lfirst(lc);
+			char	   *conninfo;
 
-			result = DistExecSimpleQuery(node_name, "SELECT 1");
-			PQclear(result);
+			if (IsLocalNode(node_name))
+				continue;
 
-			/* Success — update health */
-			DistShmemUpdateNodeHealth(node_name, GetCurrentTimestamp());
+			if (num_nodes >= MAX_DIST_NODES)
+				break;
 
-			/* If node was previously failed, handle recovery */
-			health = DistShmemGetNodeHealth(node_name);
+			strlcpy(node_names[num_nodes], node_name, NAMEDATALEN);
+
+			conninfo = GetNodeConnInfo(node_name);
+			if (conninfo != NULL)
+			{
+				strlcpy(node_conninfos[num_nodes], conninfo, 256);
+				pfree(conninfo);
+			}
+			else
+			{
+				node_conninfos[num_nodes][0] = '\0';
+			}
+			num_nodes++;
+		}
+
+		list_free_deep(nodes);
+	}
+	CommitTransactionCommand();
+
+	/*
+	 * Phase 2: Ping each node using PQping (no transaction needed).
+	 * PQping never throws an error — it returns a status code.
+	 */
+	for (int i = 0; i < num_nodes; i++)
+	{
+		NodeHealthState *health;
+		bool		ping_ok;
+
+		ping_ok = PingNodeDirect(node_names[i], node_conninfos[i]);
+
+		elog(DEBUG1, "distributed: ping %s = %s (conninfo=%s)",
+			 node_names[i], ping_ok ? "OK" : "FAIL",
+			 node_conninfos[i]);
+
+		if (ping_ok)
+		{
+			DistShmemUpdateNodeHealth(node_names[i], GetCurrentTimestamp());
+
+			health = DistShmemGetNodeHealth(node_names[i]);
+			elog(DEBUG1, "distributed: %s recovery check: health=%p, "
+				 "is_marked_failed=%d",
+				 node_names[i], health,
+				 health ? health->is_marked_failed : -1);
 			if (health != NULL && health->is_marked_failed)
 			{
-				elog(LOG, "distributed: node \"%s\" has recovered",
-					 node_name);
-				HandleNodeRecovery(node_name);
+				if (num_recovered < MAX_DIST_NODES)
+					strlcpy(recovered_nodes[num_recovered++],
+							node_names[i], NAMEDATALEN);
 			}
 		}
-		PG_CATCH();
+		else
 		{
-			/* Ping failed */
-			FlushErrorState();
-
-			health = DistShmemGetNodeHealth(node_name);
+			/*
+			 * Ensure the node has a health entry in shared memory.
+			 * DistShmemGetNodeHealth returns NULL for nodes that
+			 * have never had a successful ping (e.g. after restart).
+			 */
+			health = DistShmemGetNodeHealth(node_names[i]);
+			if (health == NULL)
+			{
+				/* Create the entry, then re-fetch it */
+				DistShmemUpdateNodeHealth(node_names[i],
+										  (TimestampTz) 0);
+				health = DistShmemGetNodeHealth(node_names[i]);
+			}
 			if (health != NULL)
 			{
 				LWLockAcquire(&DistShmem->lock, LW_EXCLUSIVE);
@@ -163,9 +240,11 @@ FailureDetectorCheck(void)
 
 					elog(LOG, "distributed: node \"%s\" marked as FAILED "
 						 "(%d consecutive failures)",
-						 node_name, health->consecutive_failures);
+						 node_names[i], health->consecutive_failures);
 
-					HandleNodeFailure(node_name);
+					if (num_failed < MAX_DIST_NODES)
+						strlcpy(failed_nodes[num_failed++],
+								node_names[i], NAMEDATALEN);
 				}
 				else
 				{
@@ -173,15 +252,62 @@ FailureDetectorCheck(void)
 				}
 			}
 		}
+	}
+
+	/*
+	 * Phase 3: Handle failures — each in its own transaction.
+	 */
+	for (int i = 0; i < num_failed; i++)
+	{
+		PG_TRY();
+		{
+			StartTransactionCommand();
+			HandleNodeFailure(failed_nodes[i]);
+			CommitTransactionCommand();
+		}
+		PG_CATCH();
+		{
+			elog(WARNING, "distributed: HandleNodeFailure for \"%s\" failed",
+				 failed_nodes[i]);
+			FlushErrorState();
+			if (IsTransactionState())
+				AbortCurrentTransaction();
+		}
 		PG_END_TRY();
 	}
 
-	list_free_deep(nodes);
+	/*
+	 * Phase 4: Handle recoveries — each in its own transaction.
+	 */
+	for (int i = 0; i < num_recovered; i++)
+	{
+		PG_TRY();
+		{
+			StartTransactionCommand();
+			elog(LOG, "distributed: node \"%s\" has recovered",
+				 recovered_nodes[i]);
+			HandleNodeRecovery(recovered_nodes[i]);
+			CommitTransactionCommand();
+		}
+		PG_CATCH();
+		{
+			elog(WARNING, "distributed: HandleNodeRecovery for \"%s\" failed",
+				 recovered_nodes[i]);
+			FlushErrorState();
+			if (IsTransactionState())
+				AbortCurrentTransaction();
+		}
+		PG_END_TRY();
+	}
 }
 
 /*
  * HandleNodeFailure
- *		Handle a node failure: update catalog, trigger re-replication.
+ *		Handle a node failure: update catalog, promote new leaders.
+ *
+ * This function runs in its own transaction (started by the caller).
+ * It copies placement data to local arrays before doing any catalog
+ * modifications to avoid iterator-invalidation issues.
  */
 void
 HandleNodeFailure(const char *node_name)
@@ -196,6 +322,19 @@ HandleNodeFailure(const char *node_name)
 	bool		replaces[Natts_pg_shard_node];
 	List	   *placements;
 	ListCell   *lc;
+	int			nplacements;
+	int			idx;
+
+	/* Local array to hold placement data (avoids iterator invalidation) */
+	typedef struct
+	{
+		int32		placementid;
+		int32		shardid;
+		int32		raftgroupid;
+		char		raftrole;
+		char		placementstate;
+	} PlacementBasicInfo;
+	PlacementBasicInfo *pinfos;
 
 	/* Step 1: Update pg_shard_node — set nodestate = 'f' (offline) */
 	rel = table_open(ShardNodeRelationId, RowExclusiveLock);
@@ -230,142 +369,126 @@ HandleNodeFailure(const char *node_name)
 
 	CommandCounterIncrement();
 
-	/* Step 2: Mark failed placements as decommissioning */
+	/*
+	 * Step 2: Read all placements for this node and copy to a local array.
+	 * This avoids issues with catalog modifications invalidating the list
+	 * during iteration.
+	 */
 	placements = GetPlacementsForNode(node_name);
+	nplacements = list_length(placements);
 
+	elog(LOG, "distributed: HandleNodeFailure for \"%s\": "
+		 "found %d placements",
+		 node_name, nplacements);
+
+	if (nplacements == 0)
+	{
+		list_free(placements);
+		return;
+	}
+
+	pinfos = palloc(nplacements * sizeof(PlacementBasicInfo));
+	idx = 0;
 	foreach(lc, placements)
 	{
 		PlacementInfo *p = (PlacementInfo *) lfirst(lc);
 
-		if (p->placementstate == PLACEMENT_STATE_ACTIVE)
-		{
-			UpdatePlacementState(p->placementid,
-								PLACEMENT_STATE_DECOMMISSIONING);
+		pinfos[idx].placementid = (int32) p->placementid;
+		pinfos[idx].shardid = p->shardid;
+		pinfos[idx].raftgroupid = p->raftgroupid;
+		pinfos[idx].raftrole = p->raftrole;
+		pinfos[idx].placementstate = p->placementstate;
+		idx++;
+		FreePlacementInfo(p);
+	}
+	list_free(placements);
 
-			elog(LOG, "distributed: marked placement %lld (shard %d) "
-				 "on failed node \"%s\" as decommissioning",
-				 (long long) p->placementid, p->shardid, node_name);
+	/*
+	 * Step 3: Process each placement from the local array.
+	 * Mark active placements as decommissioning and promote followers
+	 * to leader where needed.
+	 */
+	for (int i = 0; i < nplacements; i++)
+	{
+		elog(LOG, "distributed: processing placement %d "
+			 "(shard %d, role '%c', state '%c')",
+			 pinfos[i].placementid, pinfos[i].shardid,
+			 pinfos[i].raftrole, pinfos[i].placementstate);
+
+		if (pinfos[i].placementstate != PLACEMENT_STATE_ACTIVE)
+			continue;
+
+		UpdatePlacementState(pinfos[i].placementid,
+							PLACEMENT_STATE_DECOMMISSIONING);
+
+		elog(LOG, "distributed: marked placement %d (shard %d) "
+			 "on failed node \"%s\" as decommissioning",
+			 pinfos[i].placementid, pinfos[i].shardid, node_name);
+
+		/*
+		 * If the failed node was the leader for this shard's Raft group,
+		 * promote a surviving active follower to leader so that
+		 * GetLeaderPlacement() returns a live node.
+		 */
+		if (pinfos[i].raftrole == PLACEMENT_RAFT_LEADER)
+		{
+			List	   *group_pls;
+			ListCell   *gplc;
+			bool		promoted = false;
+
+			CommandCounterIncrement();
+			group_pls = GetPlacementsForRaftGroup(pinfos[i].raftgroupid);
+
+			foreach(gplc, group_pls)
+			{
+				PlacementInfo *gp = (PlacementInfo *) lfirst(gplc);
+
+				if (gp->placementstate == PLACEMENT_STATE_ACTIVE &&
+					gp->raftrole == PLACEMENT_RAFT_FOLLOWER &&
+					strcmp(gp->nodename, node_name) != 0)
+				{
+					UpdatePlacementRole(gp->placementid,
+										PLACEMENT_RAFT_LEADER);
+					elog(LOG, "distributed: promoted node \"%s\" "
+						 "to leader for raft group %d (shard %d)",
+						 gp->nodename, pinfos[i].raftgroupid,
+						 pinfos[i].shardid);
+					promoted = true;
+					FreePlacementInfo(gp);
+					break;
+				}
+				FreePlacementInfo(gp);
+			}
+			list_free(group_pls);
+
+			if (!promoted)
+				elog(WARNING, "distributed: no follower to promote "
+					 "for raft group %d", pinfos[i].raftgroupid);
 
 			/*
-			 * Step 3: Expedite Raft election for this group.
-			 *
-			 * If the failed node was the leader, we need a new leader.
-			 * Force an immediate election by ticking the group and
-			 * resetting the heartbeat timer on any local follower so
-			 * it triggers an election timeout.
+			 * Expedite Raft election in shared memory by resetting
+			 * the heartbeat timer. The Raft background worker will
+			 * detect the timeout on its next tick and start an election.
+			 * (We do NOT call RaftGroupTick here — that would send RPCs
+			 * which is unsafe during a catalog transaction.)
 			 */
-			if (p->raftrole == PLACEMENT_RAFT_LEADER &&
-				DistShmem != NULL)
+			if (DistShmem != NULL)
 			{
 				RaftGroupState *group;
 
-				group = DistShmemGetRaftGroup(p->raftgroupid);
-				if (group != NULL && group->in_use)
+				group = DistShmemGetRaftGroup(pinfos[i].raftgroupid);
+				if (group != NULL && group->in_use &&
+					group->role == RAFT_ROLE_FOLLOWER)
 				{
-					int		local_peer_idx;
-
-					/*
-					 * If we are a peer in this group, force election
-					 * by setting last_heartbeat to the distant past
-					 * so the next tick triggers an election.
-					 */
-					local_peer_idx = -1;
-					for (int pi = 0; pi < group->num_peers; pi++)
-					{
-						if (IsLocalNode(group->peer_names[pi]))
-						{
-							local_peer_idx = pi;
-							break;
-						}
-					}
-
-					if (local_peer_idx >= 0 &&
-						group->role == RAFT_ROLE_FOLLOWER)
-					{
-						SpinLockAcquire(&group->mutex);
-						/* Set heartbeat to 0 to trigger immediate election */
-						group->last_heartbeat = 0;
-						SpinLockRelease(&group->mutex);
-
-						/* Tick immediately to start election */
-						RaftGroupTick(group);
-
-						elog(LOG, "distributed: expedited election for "
-							 "raft group %d (shard %d) after leader "
-							 "\"%s\" failure",
-							 p->raftgroupid, p->shardid, node_name);
-					}
+					SpinLockAcquire(&group->mutex);
+					group->last_heartbeat = 0;
+					SpinLockRelease(&group->mutex);
 				}
-			}
-
-			/*
-			 * Step 4: Choose a healthy node for re-replication.
-			 * Find a node that doesn't already have a placement
-			 * for this shard group.
-			 */
-			{
-				List	   *group_placements;
-				List	   *all_nodes;
-				ListCell   *nlc;
-				char	   *target_node = NULL;
-
-				group_placements =
-					GetPlacementsForRaftGroup(p->raftgroupid);
-				all_nodes = GetAllDistNodes();
-
-				foreach(nlc, all_nodes)
-				{
-					char	   *candidate = (char *) lfirst(nlc);
-					bool		already_has = false;
-					ListCell   *plc;
-
-					/* Skip the failed node */
-					if (strcmp(candidate, node_name) == 0)
-						continue;
-
-					/* Skip nodes that already have this shard group */
-					foreach(plc, group_placements)
-					{
-						PlacementInfo *gp = (PlacementInfo *) lfirst(plc);
-
-						if (strcmp(gp->nodename, candidate) == 0 &&
-							gp->placementstate != PLACEMENT_STATE_DECOMMISSIONING)
-						{
-							already_has = true;
-							break;
-						}
-					}
-
-					if (!already_has)
-					{
-						target_node = candidate;
-						break;
-					}
-				}
-
-				if (target_node != NULL)
-				{
-					elog(LOG, "distributed: initiating re-replication of "
-						 "raft group %d to node \"%s\"",
-						 p->raftgroupid, target_node);
-					InitiateReReplication(p->raftgroupid, target_node);
-				}
-				else
-				{
-					elog(WARNING, "distributed: no available node for "
-						 "re-replication of raft group %d",
-						 p->raftgroupid);
-				}
-
-				list_free_deep(all_nodes);
-				list_free(group_placements);
 			}
 		}
-
-		FreePlacementInfo(p);
 	}
 
-	list_free(placements);
+	pfree(pinfos);
 }
 
 /*

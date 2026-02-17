@@ -23,6 +23,7 @@ extern PGDLLIMPORT int dist_election_timeout_max_ms;
 extern PGDLLIMPORT int dist_raft_tick_interval_ms;
 extern PGDLLIMPORT bool dist_allow_stale_reads;
 extern PGDLLIMPORT bool dist_propagating;
+extern PGDLLIMPORT bool dist_forwarded;
 
 /* Register GUC parameters */
 extern void DistributedGucInit(void);

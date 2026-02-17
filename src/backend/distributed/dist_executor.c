@@ -48,6 +48,9 @@ static void ExecuteRemoteForward(const char *leader_node,
 static void ExecuteScatterGatherQuery(ShardRouteInfo *route_info,
 									  const char *query_string,
 									  QueryDesc *queryDesc);
+static void InjectPGresultIntoDesc(PGresult *result, TupleDesc tupdesc,
+								   DestReceiver *dest,
+								   uint64 *total_processed);
 static void ProposeWriteThroughRaft(int32 shard_id,
 									const char *query_string,
 									Oid table_oid);
@@ -115,7 +118,7 @@ DistExecutorRunHook(QueryDesc *queryDesc, ScanDirection direction,
 	Oid			dist_table_oid = InvalidOid;
 	ShardedTableInfo *table_info;
 
-	if (!dist_enabled)
+	if (!dist_enabled || dist_forwarded)
 	{
 		standard_ExecutorRun(queryDesc, direction, count);
 		return;
@@ -575,6 +578,15 @@ ExecuteRemoteForward(const char *leader_node, const char *query_string,
 	elog(DEBUG1, "distributed: forwarding query to leader \"%s\"",
 		 leader_node);
 
+	/* Prevent remote from re-distributing this query */
+	{
+		PGresult   *set_result;
+
+		set_result = DistExecSimpleQuery(leader_node,
+										 "SET distributed.forwarded = on");
+		PQclear(set_result);
+	}
+
 	result = DistExecSimpleQuery(leader_node, query_string);
 	status = PQresultStatus(result);
 
@@ -599,70 +611,21 @@ ExecuteRemoteForward(const char *leader_node, const char *query_string,
 	else if (status == PGRES_TUPLES_OK)
 	{
 		/*
-		 * SELECT result. Inject rows into the executor's dest receiver.
-		 * We build HeapTuples from the PGresult text values and send
-		 * them through the DestReceiver.
+		 * SELECT result. Inject rows into the executor's dest receiver
+		 * using the shared InjectPGresultIntoDesc helper.
 		 */
-		int			ntuples = PQntuples(result);
-		int			nfields = PQnfields(result);
-		TupleDesc	tupdesc;
-		DestReceiver *dest;
-		int			i;
-
-		dest = queryDesc->dest;
-		tupdesc = queryDesc->tupDesc;
+		TupleDesc	tupdesc = queryDesc->tupDesc;
+		DestReceiver *dest = queryDesc->dest;
+		uint64		nprocessed = 0;
 
 		dest->rStartup(dest, queryDesc->operation, tupdesc);
-
-		for (i = 0; i < ntuples; i++)
-		{
-			Datum	   *values;
-			bool	   *nulls;
-			HeapTuple	htup;
-			TupleTableSlot *slot;
-			int			j;
-
-			values = palloc(nfields * sizeof(Datum));
-			nulls = palloc(nfields * sizeof(bool));
-
-			for (j = 0; j < nfields && j < tupdesc->natts; j++)
-			{
-				Form_pg_attribute att = TupleDescAttr(tupdesc, j);
-
-				if (PQgetisnull(result, i, j))
-				{
-					values[j] = (Datum) 0;
-					nulls[j] = true;
-				}
-				else
-				{
-					char	   *val = PQgetvalue(result, i, j);
-					Oid			typinput;
-					Oid			typioparam;
-
-					getTypeInputInfo(att->atttypid, &typinput, &typioparam);
-					values[j] = OidInputFunctionCall(typinput, val,
-													 typioparam,
-													 att->atttypmod);
-					nulls[j] = false;
-				}
-			}
-
-			htup = heap_form_tuple(tupdesc, values, nulls);
-			slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
-			ExecStoreHeapTuple(htup, slot, false);
-			dest->receiveSlot(slot, dest);
-			ExecDropSingleTupleTableSlot(slot);
-
-			pfree(values);
-			pfree(nulls);
-		}
-
+		InjectPGresultIntoDesc(result, tupdesc, dest, &nprocessed);
 		dest->rShutdown(dest);
-		queryDesc->estate->es_processed = ntuples;
+		queryDesc->estate->es_processed = nprocessed;
 
-		elog(DEBUG1, "distributed: remote read on \"%s\" returned %d rows",
-			 leader_node, ntuples);
+		elog(DEBUG1, "distributed: remote read on \"%s\" returned "
+			 "%llu rows",
+			 leader_node, (unsigned long long) nprocessed);
 	}
 	else
 	{
@@ -703,119 +666,79 @@ ExecuteScatterGatherQuery(ShardRouteInfo *route_info,
 	dest = queryDesc->dest;
 	tupdesc = queryDesc->tupDesc;
 
+	/*
+	 * Query all shard leaders uniformly via libpq connections.
+	 * Even local shards use self-connection through the connection pool
+	 * to avoid SPI tupdesc mismatches with the outer executor.
+	 *
+	 * Deduplicate: if the same node is leader for multiple shards
+	 * (e.g. after failover), query it only once.
+	 */
 	for (i = 0; i < route_info->num_shards; i++)
 	{
 		const char *node_name = route_info->leader_nodes[i];
+		bool		already_queried = false;
 
 		if (node_name[0] == '\0')
 			continue;
 
-		if (IsLocalNode(node_name))
+		/* Check if we already queried this node for an earlier shard */
+		for (int j = 0; j < i; j++)
 		{
-			/*
-			 * Execute locally for shards where we are the leader.
-			 * We run the standard executor for our local shard.
-			 */
-			standard_ExecutorRun(queryDesc, ForwardScanDirection, 0);
-			total_processed += queryDesc->estate->es_processed;
+			if (route_info->leader_nodes[j][0] != '\0' &&
+				strcmp(route_info->leader_nodes[j], node_name) == 0)
+			{
+				already_queried = true;
+				break;
+			}
 		}
-		else
+		if (already_queried)
+			continue;
+
+		PG_TRY();
 		{
-			/*
-			 * Forward to remote shard leader and collect results.
-			 */
+			PGresult   *set_result;
 			PGresult   *result;
 			ExecStatusType status;
 
-			PG_TRY();
+			/* Prevent target from re-distributing this query */
+			set_result = DistExecSimpleQuery(node_name,
+											 "SET distributed.forwarded = on");
+			PQclear(set_result);
+
+			result = DistExecSimpleQuery(node_name, query_string);
+			status = PQresultStatus(result);
+
+			if (status == PGRES_TUPLES_OK)
 			{
-				result = DistExecSimpleQuery(node_name, query_string);
-				status = PQresultStatus(result);
-
-				if (status == PGRES_TUPLES_OK)
+				if (!dest_started && tupdesc != NULL)
 				{
-					int		ntuples = PQntuples(result);
-					int		nfields = PQnfields(result);
-					int		row;
-
-					if (!dest_started && tupdesc != NULL)
-					{
-						dest->rStartup(dest, queryDesc->operation,
-									   tupdesc);
-						dest_started = true;
-					}
-
-					for (row = 0; row < ntuples; row++)
-					{
-						Datum	   *values;
-						bool	   *nulls;
-						HeapTuple	htup;
-						TupleTableSlot *slot;
-						int			col;
-
-						values = palloc(nfields * sizeof(Datum));
-						nulls = palloc(nfields * sizeof(bool));
-
-						for (col = 0; col < nfields &&
-							 col < tupdesc->natts; col++)
-						{
-							Form_pg_attribute att =
-								TupleDescAttr(tupdesc, col);
-
-							if (PQgetisnull(result, row, col))
-							{
-								values[col] = (Datum) 0;
-								nulls[col] = true;
-							}
-							else
-							{
-								char	   *val;
-								Oid			typinput;
-								Oid			typioparam;
-
-								val = PQgetvalue(result, row, col);
-								getTypeInputInfo(att->atttypid,
-												 &typinput,
-												 &typioparam);
-								values[col] = OidInputFunctionCall(
-									typinput, val, typioparam,
-									att->atttypmod);
-								nulls[col] = false;
-							}
-						}
-
-						htup = heap_form_tuple(tupdesc, values, nulls);
-						slot = MakeSingleTupleTableSlot(tupdesc,
-														&TTSOpsHeapTuple);
-						ExecStoreHeapTuple(htup, slot, false);
-						dest->receiveSlot(slot, dest);
-						ExecDropSingleTupleTableSlot(slot);
-
-						pfree(values);
-						pfree(nulls);
-					}
-
-					total_processed += ntuples;
-				}
-				else if (status == PGRES_COMMAND_OK)
-				{
-					const char *rows_str = PQcmdTuples(result);
-
-					if (rows_str && rows_str[0] != '\0')
-						total_processed +=
-							(uint64) strtoul(rows_str, NULL, 10);
+					dest->rStartup(dest, queryDesc->operation,
+								   tupdesc);
+					dest_started = true;
 				}
 
-				PQclear(result);
+				InjectPGresultIntoDesc(result, tupdesc, dest,
+									   &total_processed);
 			}
-			PG_CATCH();
+			else if (status == PGRES_COMMAND_OK)
 			{
-				elog(WARNING, "distributed: scatter-gather failed "
-					 "for node \"%s\"", node_name);
-				FlushErrorState();
+				const char *rows_str = PQcmdTuples(result);
+
+				if (rows_str && rows_str[0] != '\0')
+					total_processed +=
+						(uint64) strtoul(rows_str, NULL, 10);
 			}
-			PG_END_TRY();
+
+			PQclear(result);
 		}
+		PG_CATCH();
+		{
+			elog(WARNING, "distributed: scatter-gather failed "
+				 "for node \"%s\"", node_name);
+			FlushErrorState();
+		}
+		PG_END_TRY();
 	}
 
 	if (dest_started)
@@ -827,6 +750,75 @@ ExecuteScatterGatherQuery(ShardRouteInfo *route_info,
 		 "total %llu rows",
 		 route_info->num_shards,
 		 (unsigned long long) total_processed);
+}
+
+/*
+ * InjectPGresultIntoDesc
+ *		Convert PGresult rows to tuples and send to DestReceiver.
+ */
+static void
+InjectPGresultIntoDesc(PGresult *result, TupleDesc tupdesc,
+					   DestReceiver *dest, uint64 *total_processed)
+{
+	int			ntuples = PQntuples(result);
+	int			nfields = PQnfields(result);
+	int			natts = tupdesc->natts;
+	int			ncols = Min(nfields, natts);
+	int			row;
+	TupleTableSlot *slot;
+
+	/* Create one reusable slot for all rows */
+	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsHeapTuple);
+
+	for (row = 0; row < ntuples; row++)
+	{
+		Datum	   *values;
+		bool	   *nulls;
+		HeapTuple	htup;
+		int			col;
+
+		/* Allocate based on tupdesc natts, not PGresult nfields */
+		values = palloc0(natts * sizeof(Datum));
+		nulls = palloc(natts * sizeof(bool));
+
+		/* Initialize all columns as NULL */
+		memset(nulls, true, natts * sizeof(bool));
+
+		for (col = 0; col < ncols; col++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, col);
+
+			if (PQgetisnull(result, row, col))
+			{
+				values[col] = (Datum) 0;
+				nulls[col] = true;
+			}
+			else
+			{
+				char	   *val;
+				Oid			typinput;
+				Oid			typioparam;
+
+				val = PQgetvalue(result, row, col);
+				getTypeInputInfo(att->atttypid, &typinput, &typioparam);
+				values[col] = OidInputFunctionCall(typinput, val,
+												   typioparam,
+												   att->atttypmod);
+				nulls[col] = false;
+			}
+		}
+
+		htup = heap_form_tuple(tupdesc, values, nulls);
+		ExecStoreHeapTuple(htup, slot, true);
+		dest->receiveSlot(slot, dest);
+		ExecClearTuple(slot);
+
+		pfree(values);
+		pfree(nulls);
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	*total_processed += ntuples;
 }
 
 /*
